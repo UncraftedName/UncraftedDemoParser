@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Numerics;
 using System.Text;
 using System.Text.RegularExpressions;
 using DemoParser.Parser;
@@ -439,7 +440,7 @@ namespace ConsoleApp {
 		}
 
 
-		private static void ConsFunc_Errors() {
+		/*private static void ConsFunc_Errors() {
 			if (_runnableOptionCount > 1)
 				Console.Write("Getting errors during parsing... ");
 			if (CurDemo.ErrorList.Count == 0) {
@@ -449,6 +450,152 @@ namespace ConsoleApp {
 				SetTextWriter("errors");
 				CurDemo.ErrorList.ForEach(s => _curTextWriter!.WriteLine(s));
 			}
+		}*/
+
+
+		private static void ConsFunc_PatchJumps() {
+			SetBinaryWriter("patchjumps", "dem");
+			
+			var jumpTicks =
+				(from msgTup in CurDemo.FilterForMessage<SvcPacketEntities>()
+					from update in msgTup.message.Updates
+					where update.ServerClass.ClassName == "CPortal_Player" && update is Delta
+					from deltaProp in ((Delta)update).Props
+					where deltaProp.prop.Name == "m_Local.m_flJumpTime" &&
+						  ((SingleEntProp<float>)deltaProp.prop).Value == 510
+					select msgTup.tick).ToList();
+
+			Console.WriteLine($"detected jump ticks: {jumpTicks.SequenceToString()}");
+			
+			BitStreamWriter bsw = new BitStreamWriter(CurDemo.Reader.Data);
+
+			const int maxTicksBeforeJump = 5;
+			const int maxTicksBeyondJump = 1;
+			const float interpThreshold = 15; // this many units off the ground is considered a jump
+
+			var frames = CurDemo.Frames;
+			foreach (int jumpTick in jumpTicks) {
+				
+				int jumpTickIdx = 0;
+				for (; frames[jumpTickIdx].Type != PacketType.Packet; jumpTickIdx++); // find first packet
+				while (frames[++jumpTickIdx].Tick < jumpTick); // find the first frame with the matching tick
+				for (; frames[jumpTickIdx].Type != PacketType.Packet; jumpTickIdx++); // find the packet on this tick
+				
+				Packet groundPacket = (Packet)frames[jumpTickIdx].Packet!;
+				Vector3 groundPos = groundPacket.PacketInfo[0].ViewOrigin; // roughly the ground pos
+
+				int endTick = -1;
+				Vector3 endVec = new Vector3(float.PositiveInfinity);
+				bool shouldInterp = true;
+				
+				int idx = jumpTickIdx;
+				for (int ticksBeyondJump = 0; ticksBeyondJump < maxTicksBeyondJump; ticksBeyondJump++) {
+					
+					while (frames[++idx].Type != PacketType.Packet) ; // find the next next packet
+					
+					Packet curPacket = (Packet)frames[idx].Packet!;
+					Vector3 curViewOrigin = curPacket.PacketInfo[0].ViewOrigin;
+					
+					if (curViewOrigin.Z - groundPos.Z > interpThreshold) {
+						endTick = curPacket.Tick;
+						endVec = curViewOrigin;
+						break;
+					}
+
+					if (ticksBeyondJump == maxTicksBeyondJump - 1) {
+						shouldInterp = false;
+						Console.WriteLine($"not patching jump on tick {jumpTick}, too many ticks before air time detected");
+						break;
+					}
+				}
+				
+				if (!shouldInterp)
+					continue;
+
+				Vector3 startVec = new Vector3(float.PositiveInfinity);
+				
+				idx = jumpTickIdx;
+				for (int ticksBeforeJump = 0; ticksBeforeJump < maxTicksBeforeJump; ticksBeforeJump++) {
+					
+					while (frames[--idx].Type != PacketType.Packet); // find the previous packet
+					
+					Packet curPacket = (Packet)frames[idx].Packet!;
+					Vector3 curViewOrigin = curPacket.PacketInfo[0].ViewOrigin;
+					
+					if (curViewOrigin.Z - groundPos.Z > interpThreshold) {
+						startVec = curViewOrigin;
+						break;
+					}
+
+					if (ticksBeforeJump == maxTicksBeforeJump - 1) {
+						shouldInterp = false;
+						Console.WriteLine($"not patching jump on tick {jumpTick}, too many ticks on ground (at least {maxTicksBeforeJump}) before this jump");
+						break;
+					}
+				}
+				if (!shouldInterp)
+					continue;
+				
+				int startTick = frames[idx].Tick; // idx is currently the start tick (right before the first interp tick)
+				
+				while (frames[idx].Tick < endTick) {
+					
+					while (frames[++idx].Type != PacketType.Packet) ; // look for next packet
+					
+					BitStreamWriter simpleVecBytes = new BitStreamWriter();
+					Packet packet = (Packet)frames[idx].Packet!;
+					float lerpAmount = (float)(frames[idx].Tick - startTick) / (endTick - startTick);
+					Vector3 lerpVec = Vector3.Lerp(startVec, endVec, lerpAmount);
+					simpleVecBytes.WriteVector3(lerpVec);
+					// edit the pos in the cmdinfo
+					bsw.EditBitsAtIndex(simpleVecBytes, packet.Reader.AbsoluteStart + 32);
+					// edit the pos in the entity delta
+					var originProp = (SingleEntProp<Vector3>?)(
+							(Delta?)packet.FilterForMessage<SvcPacketEntities>().Single().Updates!
+								.SingleOrDefault(update => update.ServerClass.ClassName == "CPortal_Player"))
+						?.Props.SingleOrDefault(tuple => tuple.prop.Name == "m_vecOrigin").prop;
+					if (originProp != null) {
+						bool tryWrite = true;
+						while (tryWrite) {
+							tryWrite = false;
+							BitStreamWriter newOriginBytes = new BitStreamWriter();
+							newOriginBytes.WriteBitCoord(originProp.Value.X);
+							newOriginBytes.WriteBitCoord(originProp.Value.Y);
+							newOriginBytes.WriteBitCoord(lerpVec.Z);
+							// only edit the pos if the new value is encoded with the same number of bits
+							switch (newOriginBytes.BitLength - originProp.BitLength) {
+								case 0:
+									bsw.EditBitsAtIndex(newOriginBytes, originProp.Offset, originProp.BitLength);
+									break;
+								case 5:
+									lerpVec.Z = (float)Math.Round(lerpVec.Z);
+									tryWrite = true;
+									break;
+								case -5:
+									lerpVec.Z += 0.04f;
+									tryWrite = true;
+									break;
+								default:
+									Console.WriteLine($"bit length doesn't match, new value uses {newOriginBytes.BitLength} bits but old value has {originProp.BitLength} bits");
+									break;
+							}
+						}
+					}
+					
+					var viewOffsetProp = (SingleEntProp<float>?)(
+							(Delta?)packet.FilterForMessage<SvcPacketEntities>().Single().Updates!
+								.SingleOrDefault(update => update.ServerClass.ClassName == "CPortal_Player"))
+						?.Props.SingleOrDefault(tuple => tuple.prop.Name == "m_vecViewOffset[2]").prop;
+
+					if (viewOffsetProp != null) {
+						BitStreamWriter viewOffsetBytes = new BitStreamWriter();
+						viewOffsetBytes.WriteFloat(28);
+						bsw.EditBitsAtIndex(viewOffsetBytes, viewOffsetProp.Offset);
+					}
+				}
+			}
+			_curBinWriter!.Write(bsw);
+			Console.WriteLine("done");
 		}
 
 

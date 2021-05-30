@@ -186,10 +186,16 @@ namespace ConsoleApp {
 			};
 			
 			
-			var errorsOpt = new Option(new [] {"-e", "--errors"}, 
+			/*var errorsOpt = new Option(new [] {"-e", "--errors"}, 
 				"display all errors that occured during parsing") {
 				Required = false
+			};*/
+			
+			var patchJumpOpt = new Option(new [] {"--patch-jumps"}, 
+				"smooth out (most) jumps in a demo") {
+				Required = false
 			};
+			OptionsRequiringFolder.Add(patchJumpOpt);
 			
 			
 			var changeDirOpt = new Option(new [] {"-D", "--change-demo-dir"},
@@ -222,7 +228,7 @@ namespace ConsoleApp {
 				dTableDumpOpt,
 				actionsPressedOpt,
 				passThroughPortalsOpt,
-				errorsOpt,
+				patchJumpOpt,
 				changeDirOpt,
 				pausesOpt
 			};
@@ -260,7 +266,7 @@ namespace ConsoleApp {
 				bool recursive,
 				bool jumps,
 				bool removeCaptions,
-				bool errors,
+				bool patchJumps,
 				bool pauses,
 				string changeDemoDir,
 				DataTablesDispType dumpDatatables,
@@ -360,8 +366,10 @@ namespace ConsoleApp {
 							ConsFunc_DumpJumps();
 						if (removeCaptions)
 							ConsFunc_RemoveCaptions();
-						if (errors)
-							ConsFunc_Errors();
+						/*if (errors)
+							ConsFunc_Errors();*/
+						if (patchJumps)
+							ConsFunc_PatchJumps();
 						if (changeDemoDir != null)
 							ConsFunc_ChangeDemoDir(changeDemoDir);
 						if (pauses)
